@@ -187,7 +187,7 @@ def fetch_youtube_videos(search_queries: List[str]) -> Dict[str, Any]:
                     published_at = item["snippet"]["publishedAt"]
                     pub_date = datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%SZ")
                     days_old = max(1, (datetime.utcnow() - pub_date).days)
-                    score = (likes * 2 + views) / days_old
+                    # score = (likes * 2 + views) / days_old
 
                     video_data = {
                         "video_title": item["snippet"]["title"],
@@ -199,7 +199,7 @@ def fetch_youtube_videos(search_queries: List[str]) -> Dict[str, Any]:
                         "publish_date": published_at,
                         "view_count": views,
                         "like_count": likes,
-                        "score": score,
+                        # "score": score,
                         "search_query": query
                     }
 
@@ -301,23 +301,111 @@ async def generate_learning_path(request: CourseRequest):
             chapter_model.videos = YouTubeResources(**yt_data)
             full_chapters.append(chapter_model)
 
-        return LearningPathResponse(
-            course_title=intro_data["course_title"],
-            difficulty=request.difficulty,
-            description=request.description,
-            chapters=full_chapters,
-            learning_path_summary=LearningPathSummary(
-                overview="This course provides a deep dive into the topic with practical chapters and visual resources.",
-                time_commitment="Approx. 1–2 weeks",
-                assessment_methods=["Quizzes", "Mini Projects", "Discussions"],
-                next_steps=["Explore advanced topics", "Join communities", "Apply knowledge"]
-            ),
-            metadata={
+        # Prepare final course object
+        course_data = {
+            "course_title": intro_data["course_title"],
+            "difficulty": request.difficulty,
+            "description": request.description,
+            "chapters": [c.dict() for c in full_chapters],
+            "learning_path_summary": {
+                "overview": "This course provides a deep dive into the topic with practical chapters and visual resources.",
+                "time_commitment": "Approx. 1–2 weeks",
+                "assessment_methods": ["Quizzes", "Mini Projects", "Discussions"],
+                "next_steps": ["Explore advanced topics", "Join communities", "Apply knowledge"]
+            },
+            "metadata": {
                 "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "youtube_resources_count": sum(len(c.videos.videos) for c in full_chapters),
                 "total_chapters": len(full_chapters)
+            }
+        }
+
+        # Upload to S3
+        filename = f"{intro_data['course_title'].replace(' ', '_')}_{int(time.time())}"
+        s3_uri = upload_course_to_s3(course_data, filename)
+
+        print(f"✅ Course uploaded to S3: {s3_uri}")
+
+        # Return course (without s3_uri in model but you can add it to metadata)
+        return LearningPathResponse(
+            course_title=course_data["course_title"],
+            difficulty=course_data["difficulty"],
+            description=course_data["description"],
+            chapters=full_chapters,
+            learning_path_summary=LearningPathSummary(**course_data["learning_path_summary"]),
+            metadata={
+                **course_data["metadata"],
+                "s3_uri": s3_uri
             }
         )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail={"error": str(e)})
+
+@app.post("/upload-course-to-s3")
+def upload_course_to_s3(course_data: dict, filename: str) -> str:
+    s3 = boto3.client(
+        "s3",
+        region_name=AWS_REGION,
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY
+    )
+
+    bucket_name = os.getenv("S3_BUCKET_NAME")
+    folder = os.getenv("S3_FOLDER", "courses")
+    key = f"{folder}/{filename}.json"
+
+    s3.put_object(
+        Bucket=bucket_name,
+        Key=key,
+        Body=json.dumps(course_data, indent=2),
+        ContentType="application/json"
+    )
+
+    return f"s3://{bucket_name}/{key}"
+
+from fastapi.responses import JSONResponse
+
+@app.get("/list-courses/")
+def list_courses():
+    try:
+        s3 = boto3.client(
+            "s3",
+            region_name=AWS_REGION,
+            aws_access_key_id=AWS_ACCESS_KEY,
+            aws_secret_access_key=AWS_SECRET_KEY
+        )
+        bucket_name = os.getenv("S3_BUCKET_NAME")
+        folder = os.getenv("S3_FOLDER", "courses")
+
+        result = s3.list_objects_v2(Bucket=bucket_name, Prefix=f"{folder}/")
+
+        files = [
+            obj["Key"].split("/")[-1].replace(".json", "")
+            for obj in result.get("Contents", [])
+            if obj["Key"].endswith(".json")
+        ]
+        return {"courses": files}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
+
+@app.get("/get-course/{course_name}")
+def get_course(course_name: str):
+    try:
+        s3 = boto3.client(
+            "s3",
+            region_name=AWS_REGION,
+            aws_access_key_id=AWS_ACCESS_KEY,
+            aws_secret_access_key=AWS_SECRET_KEY
+        )
+        bucket_name = os.getenv("S3_BUCKET_NAME")
+        folder = os.getenv("S3_FOLDER", "courses")
+        key = f"{folder}/{course_name}.json"
+
+        response = s3.get_object(Bucket=bucket_name, Key=key)
+        course_data = json.loads(response["Body"].read())
+        return JSONResponse(content=course_data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e)})
+
