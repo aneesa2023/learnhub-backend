@@ -15,6 +15,7 @@ from datetime import datetime
 from fastapi import Body, Request
 from fastapi.responses import JSONResponse
 from fastapi import APIRouter
+import re
 
 # Load environment variables
 load_dotenv()
@@ -37,7 +38,6 @@ MODEL_IDS = {
     "General": "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 }
 
-# AWS Configuration
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
@@ -53,7 +53,6 @@ bedrock_client = boto3.client(
     aws_secret_access_key=AWS_SECRET_KEY
 )
 
-# Middleware
 middleware = [
     Middleware(
         CORSMiddleware,
@@ -124,6 +123,8 @@ class LearningPathSummary(BaseModel):
     time_commitment: str
     assessment_methods: List[str]
     next_steps: List[str]
+    recommended_study_links: Optional[List[str]] = []
+    course_summary: Optional[str] = None
 
 class CourseRequest(BaseModel):
     topic: str
@@ -141,6 +142,17 @@ class LearningPathResponse(BaseModel):
     learning_path_summary: LearningPathSummary
     metadata: Dict[str, Any]
 
+def safe_json_loads(response_text: str):
+    try:
+        response_text = re.sub(r"[\x00-\x1f\x7f]", "", response_text)
+        return json.loads(response_text)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=500, detail={
+            "error": "Claude returned invalid JSON",
+            "json_error": str(e),
+            "raw_output": response_text
+        })
+
 def call_bedrock_api(model_id: str, prompt: str) -> str:
     payload = {
         "anthropic_version": "bedrock-2023-05-31",
@@ -149,14 +161,23 @@ def call_bedrock_api(model_id: str, prompt: str) -> str:
         "temperature": 0.5,
         "top_p": 0.9
     }
-    response = bedrock_client.invoke_model(
-        modelId=model_id,
-        body=json.dumps(payload),
-        contentType="application/json",
-        accept="application/json"
-    )
-    response_body = json.loads(response["body"].read().decode("utf-8"))
-    return response_body.get("content", [{}])[0].get("text", "")
+    for attempt in range(5):
+        try:
+            response = bedrock_client.invoke_model(
+                modelId=model_id,
+                body=json.dumps(payload),
+                contentType="application/json",
+                accept="application/json"
+            )
+            response_body = json.loads(response["body"].read().decode("utf-8"))
+            return response_body.get("content", [{}])[0].get("text", "")
+        except bedrock_client.exceptions.ThrottlingException:
+            wait = 2 ** attempt
+            print(f"🕐 Throttled. Retrying in {wait} seconds...")
+            time.sleep(wait)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail={"error": str(e)})
+    raise HTTPException(status_code=429, detail={"error": "Too many requests to Claude. Please try again later."})
 
 def fetch_youtube_videos(search_queries: List[str]) -> Dict[str, Any]:
     videos = []
@@ -194,7 +215,7 @@ def fetch_youtube_videos(search_queries: List[str]) -> Dict[str, Any]:
                     likes = int(item["statistics"].get("likeCount", 0))
                     published_at = item["snippet"]["publishedAt"]
                     pub_date = datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%SZ")
-                    days_old = max(1, (datetime.utcnow() - pub_date).days)
+                    # days_old = max(1, (datetime.utcnow() - pub_date).days)
                     # score = (likes * 2 + views) / days_old
 
                     video_data = {
@@ -224,6 +245,16 @@ def fetch_youtube_videos(search_queries: List[str]) -> Dict[str, Any]:
         "videos": top_videos,
         "limits_applied": YOUTUBE_LIMITS
     }
+
+def build_course_summary_prompt(course_title: str, chapters: List[Dict[str, Any]]) -> str:
+    chapter_titles = ", ".join([f'"{c["chapter_title"]}"' for c in chapters])
+    return f"""
+Write a 200-word summary for a course titled "{course_title}". 
+The course covers the following chapters: {chapter_titles}.
+The summary should introduce the course, highlight key learning outcomes, 
+and end with what learners can expect to achieve.
+Format: plain text only. No markdown or JSON.
+"""
 
 def generate_prompt(category, topic, description, difficulty, chapters, tone_output_style):
     base_instructions = f"""
@@ -282,18 +313,31 @@ You are continuing from this course introduction:
 
 Now write full content for Chapter {chapter_number}: \"{chapter_title}\" for the course \"{req.topic}\".
 
+🎯 Guidelines for `study_notes` field:
+- Use short paragraphs and bullet points for clarity.
+- Include visual section headers like "🔥 Key Insights", "💡 Examples", "🧠 Summary".
+- Add inline code snippets using backticks for technical terms or examples.
+- Highlight important definitions and concepts in **bold**.
+- Where applicable, provide visual metaphors or real-world analogies.
+- Add code examples, formulas, or sample problems if relevant.
+- Maintain an audio-friendly, engaging tone.
+
+⚠️ Output format rules:
+- Return response in **strict JSON** only, no markdown or commentary.
+- `study_notes` must be a single string (not markdown), with at least 2000 characters of rich, structured content.
+- No introductory or closing statements like “In conclusion” or “Thank you”.
+
 Format must be:
+
 {{
   "chapter_number": int,
   "chapter_title": "string",
   "learning_objectives": ["string"],
   "key_concepts": [{{"title": "string", "explanation": "string"}}],
   "practical_applications": ["string"],
-  "study_notes": "Minimum 2000 characters of audio-friendly explanations.",
+  "study_notes": "Minimum 2000 characters of structured, audio-friendly, formatted explanations.",
   "youtube_keywords": ["string"]
 }}
-
-NO markdown, NO closing statements, just strict JSON format.
 """
 
 def fix_ai_chapter_format(chapter, index):
@@ -336,11 +380,28 @@ async def generate_learning_path(request: CourseRequest):
                 chapter_number=chapter["chapter_number"]
             )
             chapter_response = call_bedrock_api(model_id, chapter_prompt)
-            chapter_data = json.loads(chapter_response)
+            # chapter_data = json.loads(chapter_response)
+            chapter_data = safe_json_loads(chapter_response)
             chapter_model = fix_ai_chapter_format(chapter_data, chapter["chapter_number"] - 1)
             yt_data = fetch_youtube_videos(chapter_model.youtube_keywords)
             chapter_model.videos = YouTubeResources(**yt_data)
             full_chapters.append(chapter_model)
+
+        # 🧠 Add global recommended study links from top video links
+        study_links = []
+        for chapter in full_chapters:
+            if chapter.videos and chapter.videos.videos:
+                for video in chapter.videos.videos:
+                    if video.video_link not in study_links:
+                        study_links.append(video.video_link)
+
+        # Just keep top 3–5 links
+        study_links = study_links[:5]
+        summary_prompt = build_course_summary_prompt(
+            intro_data["course_title"],
+            intro_data["chapters"]
+        )
+        summary_text = call_bedrock_api(model_id, summary_prompt).strip()
 
         # Prepare final course object
         course_data = {
@@ -352,7 +413,9 @@ async def generate_learning_path(request: CourseRequest):
                 "overview": "This course provides a deep dive into the topic with practical chapters and visual resources.",
                 "time_commitment": "Approx. 1–2 weeks",
                 "assessment_methods": ["Quizzes", "Mini Projects", "Discussions"],
-                "next_steps": ["Explore advanced topics", "Join communities", "Apply knowledge"]
+                "next_steps": ["Explore advanced topics", "Join communities", "Apply knowledge"],
+                "recommended_study_links": study_links,
+                "course_summary": summary_text
             },
             "metadata": {
                 "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
